@@ -1,0 +1,561 @@
+<!-- https://www.mediawiki.org/wiki/Help:Formatting -->
+
+[[File:ZCU102.png|right|350px|thumb|Zynq Ultrascale+ ZCU102]]
+
+== Introduzione ==
+Lo scopo dell'elaborato è lo sviluppo di un controller HDMI&trade; sulla board Zynq Ultrascale+ ZCU102. La board Zynq Ultrascale+ offre una logica programmabile (PL) tale da permettere la sintesi del componente nonchè il supporto all'installazione di un sistema operativo completo sul sistema. Per questo motivo,  la scheda permette il funzionamento della logica programmabile sintetizzata introducendo gli opportuni driver adibiti al suo pilotaggio. Pertanto, il controller dovrà funzionare sotto ambiente Linux esponendo delle syscall in user-level per controllare in maniera arbitraria il flusso video in uscita. L'obiettivo prefissato è quello di descrivere efficacemente l'architettura ed i principi di funzionamento del controller HDMI ma anche documentare la sua integrazione con il processing system ed la sua integrazione con il sistema operativo Linux.
+
+=== Funzionialità di base ===
+Il controller HDMI è un dispositivo essenziale per la gestione delle interfacce video e l'implementazione del protocollo di comunicazione specifico. Il suo obiettivo finale è quello di consentire la comunicazione tra la board ZCU102 ed un device esterno, detto Sink, servendosi della porta HDMI in dotazione.
+Dal lato PL il controller sarà composto dalla sola componente di trasmissione video, in particolare lo scopo è quella di supportare in maniera completa il protocollo HDMI&trade; 2.0 il quale permette di gestire un flusso video in uscita fino alla risoluzione 4K@60fps 8bpp pari ad un throughput massimo di 18Gbps. 
+
+Lo schema generale è quello di un ''framebuffer'', un dispositivo che permette le seguenti operazioni:
+#Codifica e decodifica dei dati secondo il protocollo HDMI, permettendone l'invio verso un pozzo oppure la ricezione. Per permettere questo meccanismo sono presenti dei sottosistemi di trasmissione e ricezione detti ''Tx e Rx Subsystem''.
+#Invio dei dati attraverso la conversione dei dati codificati in segnali elettrici sul canale, mediante l'utilizzo di un ''controller PHY''.
+#Generazione di dati audio/video mediante un dispositivo dedicato, detto ''Test Patter Generator (TPG)''.
+
+Dal lato PS sarà necessario lo sviluppo di un driver linux capace di pilotare l'hardware implementato dalla controparte PL astraendone gli aspetti implementativi.
+
+== Protocollo HDMI ==
+
+<div style="margin-left: 50px; float: right;">
+{| class="wikitable" style="text-align:center;margin:auto 
+'''Piedinatura'''
+|- 
+|colspan="3" style="text-align: center; font-size: 95%; border-bottom: 1px solid #aaa;" |
+[[File:HDMI_Connector_Pinout.png|thumb|HDMI Connector Pinout|center|350px|thumb|Presa HDMI (femmina) Tipo A Molex 500254-1907]] 
+|- 
+| 
+| <b>Nome</b>
+| <b>Descrizione</b>
+|- 
+! PIN 1
+| TMDS Data2+
+| Rosso
+|- 
+! PIN 2
+| Schermatura
+| TMDS Data2
+|- 
+! PIN 3
+| TMDS Data2–
+| Rosso
+|- 
+! PIN 4
+| TMDS Data1+
+| Verde
+|- 
+! PIN 5
+| Schermatura
+| TMDS Data1
+|- 
+! PIN 6
+| TMDS Data1–
+| Verde
+|- 
+! PIN 7
+| TMDS Data0+
+| Blu
+|- 
+! PIN 8
+| Schermatura
+| TMDS Data0
+|- 
+! PIN 9
+| TMDS Data0–
+| Blu
+|- 
+! PIN 10
+| TMDS Clock+
+| 
+|- 
+! PIN 11
+| Schermatura
+| TMDS Clock
+|- 
+! PIN 12
+| TMDS Clock–
+| 
+|- 
+! PIN 13
+| CEC
+| 
+|- 
+! PIN 14
+| Riservato (Dalla versione 1.4: HEC e ARC)
+| Da non collegare sui dispositivi
+|- 
+! PIN 15
+| SCL
+| 
+|- 
+! PIN 16
+| SDA
+| 
+|- 
+! PIN 17
+| Massa
+| DDC/CEC
+|- 
+! PIN 18
+| Alimentazione +5 V
+| (max 50 mA)
+|- 
+! PIN 19
+| Rilevamento Hot Plug (Dalla versione 1.4: HEC e ARC)
+|}
+</div>
+
+Con il termine HDMI (High Definition Multimedia Interface)[1] si intende un'interfaccia per il trasferimento di dati audiovisivi tra una sorgente ed un dispositivo compatibile in ricezione. Nel corso degli anni, HDMI ha subito diverse migliorie ed aggiornamenti, tuttavia lo scopo principale alla base della sua introduzione era la possibilità di estendere i vantaggi dei vecchi standard (DVI e VGA in primis) mantendendo al contempo retrocompatibilità e i vantaggi di questi ultimi. Nella sua prima versione, HDMI 1.0 era progettato per i televisori con tecnologia HD allo scopo di migliorare la qualità visiva delle immagini e migliorando il supporto alla codifica video YcbCr. Nel 2013 viene introdotto HDMI 2.0, anche noto come HDMI UHD, per la sua compatibilità alla risoluzione 4K. Più specificamente, a partire dalla versione 1.4 di HDMI, lo standard di riferimento è EIA/CEA 861-E, il quale ha lo scopo di definire il formato video, la colorimetria ed il modo in cui vengono trasferiti i dati sia in modalità compressa che non compressa. 
+
+=== Caratteristiche del protocollo ===
+*Il protocollo HDMI è bidirezionale, quindi sorgente e destinatario del segnale video possono inviare entrambi informazioni sul canale. Oltre ai dati relativi al solo streaming audio-video, la trasmissione HDMI comprende il transito di informazioni relative alle caratteristiche del destinatario. Lo scambio di queste informazioni preliminari avviene in una fase di '''handshaking''', grazie alla quale si configurano aspetti della comunicazione come HDCP, capacità audio e risoluzione video.
+Di particolare importanza è lo scambio durante questa fase di una struttura dati detta EDID. Tale struttura, viene inviata da un sink verso il trasmettitore al fine di comunicare tutte le possibili modalità di ricezione supportate (in termini di risoluzione e framerate). Il trasmettitore dovrà scegliere una di queste impostazioni supportate dal sink per poter dare inizio alla comunicazione. 
+*I dati audio e video vengono codificati utilizzando una codifica detta TMDS (Transition Minimized Differential Signaling), la quale assicura un numero basso di transizioni del segnale al fine di ridurre i fenomeni di interferenza e rumore sul flusso di dati codificati. I dati, a gruppi di 8 bit, vengono convertiti in simbolo costituito da 10 bit favorendo l'individuazione e la correzione degli errori. La trasmissione dei dati codificati è differenziale, ciò significa che ogni bit viene rappresentato dal valore di due segnali, i quali vengono poi trasferiti fisicamente sul canale. 
+*A partire dalla prima versione di HDMI è stato introdotto un sistema di crittografia per la protezione dello streaming video, detto HDCP (High-bandwidth Digital Content Protection).
+
+== Block design ==
+Volendo realizzare in hardware un dispositivo che implementi il protocollo e permetta lo streaming di dati in uscita dalla board è sufficiente fare riferimento ad alcune IP messe a disposizione da Xilinx [2]. 
+
+[[File:SchemaBlocchi1.png |center|650px | Schema a blocchi della architettura da realizzare]]
+
+I meccanismi di funzionamento di un controller HDMI prevedono la ricezione e la trasmissione di segnali audio e video permettendo la comunicazione tra sorgente e destinazione attraverso la codifica e decodifica dei segnali, l'handshaking e l'implementazione del resto del protocollo. 
+Possiamo individuare un insieme di componenti utili alla realizzazione di questi meccanismi la cui interconnessione è descritta da un semplice schema a blocchi.
+
+=== Tx e Rx Subsystem ===
+Il sottosistema trasmettitore HDMI 1.4/2.0 è un soft IP completo di tutte le funzionalità necessarie per interfacciarsi correttamente con i livelli PHY e fornire funzionalità di codifica HDMI. Il sottosistema è un IP di tipo gerarchico che raggruppa una serie di sotto-core di IP relativi al TX HDMI e li emette come un unico IP. Il sottosistema riceve i flussi video e audio in ingresso e li trasferisce in un flusso di tipo HDMI. Il flusso viene poi inoltrato al livello PHY [3].
+
+
+[[File:TxSubsystem.png|center|650px|thumb|Esempio di architettura per il funzionamento di un Subsystem Tx]]
+
+Attorno al core HDMI TX vengono possono essere aggiunti vari moduli di supporto in base alla configurazione desiderata. In generale, il core HDMI TX è progettato per supportare l'interfaccia video nativa, tuttavia molti dei core IP di elaborazione video esistenti sono basati su AXI4-Stream. Questo permette al sottosistema HDMI 1.4/2.0 TX di lavorare senza problemi con altri core di elaborazione video e altri IP presenti nell'architettura. Il sottosistema TX HDMI 1.4/2.0 è in grado di supportare opzionalmente la crittografia HDCP 1.4 e HDCP 2.3.
+
+[[File:HDMItxarch.png|center|650px|thumb|Schema del'architettura di un HDMI TX subsystem]]
+
+Analogamente, anche il sottosistema Rx ha il compito di interfacciarsi con il livello PHY, ma in verso opposto. Riceve in input dei segnali TDMS da tale livello e opera per ricevere in maniera aderente al protocollo HDMI lo streaming video, comunicando con gli altri componenti avvalendosi dell'interfaccia AXI-Stream.
+
+[[File:HDMIrxarch.png|center|650px|thumb|Schema del'architettura di un HDMI RX subsystem]]
+
+=== VideoPHY ===
+Il core Video PHY Controller è un soft IP che incorpora tutta la logica necessaria per l'interfacciamento con i livelli MAC (Media Access Control) ed eseguire le funzionalità PHY (Physical Side Interface) [4]. 
+Tra le funzionalità più importanti di questo dispositivo si ha:
+
+*'''Codifica e decodifica dei segnali HDMI''': durante la trasmissione, il device converte i dati audio e video in segnali elettrici compatibili con il protocollo HDMI. Mentre, durante la fase di ricezione, decodifica i segnali HDMI ricevuti dai dispositivi di visualizzazione per convertirli in dati digitali interpretabili dal resto del sistema (secondo la logica del protocollo).
+
+*'''Compensazione di disturbi e rumore''': il device si occupa di equalizzare i segnali e compensare eventuali disturbi e jitter introdotti nel segnale durante la trasmissione. Questo assicura che i dati audio e video siano trasmessi senza degrado della qualità del segnale.
+
+*'''Implementazione del hot plug''': il dispositivo è in grado di rilevare eventi di hot plug e disconnect, ovvero particolari segnali di controllo che vengono alzati, secondo la logica del protocollo HDMI, quando un device decide di collegarsi o scollegarsi. Al verificarsi di un evento di hot plug, viene effettuato un handshake per la negoziazione delle capacità dei dispositivi comunicanti.
+
+[[File:HDMIphyarch.png|center|650px|thumb|Schema di funzionamento di un controller PHY]]
+
+Il tipico scenario di una trasmissione video, segue le regole del protocollo AXI4-Stream per la comunicazione tra Tx Subsystem e controller PHY.
+"Un trasferimento valido si verifica ogni volta che ''READY'', ''VALID'' e ''AP_RST_N'' sono alti sul fronte di salita di ''AP_CLK''. Durante i trasferimenti validi, ''DATA'' trasporta solo dati video attivi. Il segnale ''Start-Of-Frame (SOF)'', trasmesso fisicamente attraverso il segnale ''TUSER0'' di AXI4-Stream, segnala il primo pixel di un frame video. Il segnale ''SOF'' serve come segnale di sincronizzazione del frame, che consente ai core a valle di reinizializzarsi e di rilevare il primo pixel di un dato frame.
+Infine, il segnale ''End-Of-Line (EOL)'', trasmesso fisicamente attraverso il segnale AXI4-Stream ''TLAST'', segna l'ultimo pixel di una linea [5]. 
+
+[[File:Axi4-stream-Txsubsystem.png|center|750px|thumb|Schema di funzionamento di un trasferimento secondo il protocollo AXI4-Stream.]]
+
+Si ricorda che la trasmissione dei bit relativi ad un singolo pixel comprende in totale 24 bit: 
+#8 bit relativi alla codifica della componente R.
+#8 bit relativi alla codifica della componente G.
+#8 bit relativi alla codifica della componente B.
+
+
+==== Test Pattern Generator ====
+Il core LogiCORE IP Video Test Pattern Generator genera modelli di test per la valutazione e il debug di sistemi video. Il core fornisce un'ampia gamma di modelli di test che consentono di eseguire il debug e di valutare le prestazioni in termini di colore e qualità del sistema video. Il dispositivo può essere inserito in un'interfaccia video AXI4-Stream che consente il passaggio dei segnali video del sistema o l'inserimento dei pattern di test [6].
+
+[[File:SchemaBlocchi2.png|center|650px|thumb|Esempio di schema a blocchi che evidenzia la presenza del Test Pattern Generator.]]
+
+Utilizzando un TPG, non è necessario sviluppare e caricare un programma utente per generare il video di test. Questo rende il processo di iniezione del segnale video più semplice e consente di eseguire test rapidamente, senza dover preoccuparsi della scrittura e del debug del software. In altre parole, è possibile istanziare il componente hardware all'interno dell'architettura del trasmettitore al fine di eseguire più semplicemente le operazioni di trasmissione e garantendo un funzionamento corretto e prevedibile.
+
+== Progetto standalone ==
+La realizzazione di un progetto standalone prevede dapprima la sintesi dell'architettura del controller, servendosi della design suite Vivado e successivamente del programma Vitis per la generazione dei file adibiti al testing dell'hardware. Il termine standalone, ovviamente, allude al fatto che il questa fase del progetto non è ancora presente un vero e proprio sistema operativo sulla board tale da permettere l'utilizzo del controller mediante appositi driver. 
+
+[[File:HDMIlicenses.png|center|550px|thumb|Licenze richieste per la realizzazione del design del controller.]]
+
+=== IP Xilinx Tx Subsystem ===
+Per realizzare l'architettura descritta nelle sezioni precedenti, è sufficiente richiamare opportunamente dei blocchi la cui proprietà intellettuale (IP) appartiene a Xilinx e che sono utilizzabili sotto licenza. In altre parole, gli IP sono componenti predefiniti, progettati per svolgere funzioni specifiche e possono essere integrati per semplificare lo sviluppo di soluzioni complesse, consentendo agli sviluppatori di utilizzare blocchi predefiniti invece di dover creare da zero componenti specifici from scratch.
+
+Per poter utilizzare le IP di Xilinx, è sufficiente richiederne una licenza di prova, la quale viene direttamente associata al proprio account e all'indirizzo fisico della macchina che dovrà eseguire la sintesi.
+
+La generazione dei componenti necessari per la realizzazione del controller avviene grazie all'utilizzo della IP denominata ''Tx-subsystem-ss'', grazie alla quale è possibile istanziare più componenti insieme ed interconnetterli in maniera immediata.
+
+[[File:SelectTxIP.png|center|650px|thumb|Selezione della IP corrispondente al Tx subsystem.]]
+
+==== Configurazione Tx Subsystem ====
+Esistono diverse configurazioni per l'''hdmi transmitter subsystem'', quella adibita alla generazione del sottosistema per la ricezione è però la configurazione ''passthrough''. In particolare, il dispositivo può essere configurato come:
+
+[[File:HDMIpassthrough.png|center|550px|thumb|]]
+
+La configurazione complessiva della IP è riassunta nella seguente tabella:
+
+{| class="wikitable"  style="text-align:center;margin:auto"
+!Descrizione !! Valore 
+|-
+| Board || ZCU102 Revision 1.x 
+|-
+| Include HDCP 1.4 Encryption || No 
+|-
+| Include HDCP 2.3 Encryption || No 
+|-
+| Max bits per component || 8
+|-
+| Number of bits per clock || 2
+|-
+| Design Topology || Pass-Through
+|-
+| Axilite frequency || 100
+|-
+| Tx PLL Type || QPLL0/1
+|-
+| Rx PLL Type || CPLL
+|-
+| Include NIDRU || Enabled
+|}
+
+Dove, in particolare si ha:
+*Ogni componente è assegnata ad 8 bit e ad ogni colpo di clock avviene il trasferimento di due bit relativi alle componenti.
+*Tx PLL Type - QPLL0/1 (e Rx): si intende come meccanismo di sincronizzazione del clock. QPLL sta per "Quad PLL", il che implica che questo tipo di PLL può generare più clock indipendenti all'interno del sottosistema di trasmissione.
+*Include NIDRU (Non-Interpolating Digital Recovery Unit) - Enabled: è una feature che permette al sistema ricevitore (Rx) di poter recuperare il clock di riferimento senza ricorrere ad elaborazioni di interpolazione.
+
+Come già descritto nel paragrafo precedente, selezioniamo l'impostazione per imporre che i componenti siano istanziati con interfaccia AXI4-Lite per permettere loro la comunicazione.
+Una volta introdotti tutti i dispositivi hardware necessari, è possibile ottenere, in maniera immediata, il codice Verilog associato ai componenti nonchè l'architettura complessiva in termini di ''block design''.
+
+[[File:HDMIcontrollerCompact.png|center|750px|thumb|Architettura del controller HDMI.]]
+
+==== Generazione bistream ====
+Una volta realizzate tutte le connessioni necessarie, il design complessivo può essere convertito in '''bitstream'''. Il bitstream che è possibile generare tramite Vivado, è essenzialmente un flusso di dati binari che rappresenta la configurazione dell'FPGA, ovvero l'organizzazione delle sue risorse logiche, il comportamento delle porte e il collegamento tra i blocchi interni. Questo file, successivamente, viene caricato sulla parte PL della board ZCU102, in modo tale da implementare dal punto di vista fisico il modello hardware del controller sintetizzato.
+
+[[File:HDMIcontrollerFull.png|center|750px|thumb|Architettura (estesa) del controller HDMI.]]
+
+Selezionando opportunamente la voce ''generate bitstream'', il processo di sintesi avviene automaticamente, se non sono presenti errori durante la generazione dell'architettura o nei collegamenti tra i dispositivi componenti.
+
+==== Utilizzo di Vitis per test dell'hardware ====
+Una volta completata la fase di generazione del bitstream, è possibile utilizzare l'ambiente Vitis per realizzare un testing delle funzionalità dell'architettura. Per poter lavorare sul controllore sintetizzato nelle fasi precedenti è necessario utilizzare un file ''.xsa''. L'.''xsa'' contiene la configurazione completa del sistema, inclusi i dettagli dell'architettura hardware come FPGA o SoC utilizzati, i tipi di dispositivi periferici, le connessioni tra i blocchi, la configurazione delle interfacce di comunicazione e altro ancora. Queste informazioni sono fondamentali per impostare correttamente l'ambiente di sviluppo e garantire la compatibilità tra l'applicazione e la piattaforma hardware.A partire dal file .xsa generato tramite il progetto Vivado, è possibile importare l'architettura su Vitis al fine di poter introdurre opportuni strumenti software adibiti al suo test. 
+
+Navigando nell'interfaccia di Vitis si selezionano le seguenti voci 
+
+        File -> New -> Platform Project ->  Create a new platform from .xsa 
+
+Pertanto, a partire dai file importati, è sufficiente effettuare il building del progetto per personalizzare la configurazione software per l'architettura.
+
+[[File:VitisHDMI1.png|center|650px|thumb|Progetto Vitis associato al design xsa importato.]]
+
+Sfruttando il board support package (BSP) introdotto grazie al building del progetto per la ZCU102, è possibile introdurre opportuni driver per testare l'architettura. In particolare, 
+
+il BSP contiene le informazioni necessarie per configurare correttamente l'hardware della piattaforma di destinazione. Alcune di queste informazioni comprendono la definizione delle periferiche, le interfacce di comunicazione, i timer, e altre configurazioni specifiche del dispositivo.
+Il BSP, inoltre, permette di includere i driver software per le periferiche e le interfacce di comunicazione presenti sulla piattaforma. 
+
+Effettuando la connessione alla scheda tramite UART, Vitis permette il caricamento del bitstream sulla parte programmabile dell'architettura nonchè l'invio di comandi adibiti al test dell'architettura stessa. L'introduzione dei driver di test, infatti, permette di dialogare secondo un'interfaccia di questo tipo:
+
+    ---------------------
+    --- MAIN MENU ---
+    ---------------------
+    i - Info
+    => Displays HDMI info.
+    h - HDCP Info
+    => Displays HDCP info.
+    d - Display Logs
+    => Display HDMI and HDCP logs.
+    c - Colorbar
+    => Displays the colorbar on the source output.
+    r - Resolution
+    => Change the video resolution of the testpattern.
+    f - Pixel-Format
+    => Change the pixel-format of the testpattern.
+    p - Pass-through
+    => Passes the HDMI sink input to source output.
+    t - Tiles-pattern
+    => Displays a tile-pattern on the source output.
+    e - EDID
+    => Display and set edid.
+    99 - Exit
+
+Sono stati effettuati vari test del controller HDMI, selezionando diverse risoluzioni (360p,720p,1080p)e pattern di test (colorbar, noise, chessboard, grid): tutti hanno avuto esito positivo, mostrando a schermo le immagini senza alterazioni cromatiche o di risoluzione. Aver sintetizzato correttamente il design del controller ha permesso di poter utilizzare dei driver di base per la board di riferimento dando la facoltà di testare l'architettura pur non avendo un vero e proprio sistema operativo a bordo del sistema. Nella sezione successiva, si prova a sopperire a questo difetto, realizzando una build di petalinux che incorpori il caricamento del progetto sintetizzato e allo stesso tempo i driver necessari per il suo corretto funzionamento.
+
+[[File:ZCUcolorbar.png|right|300px|thumb]]
+[[File:ZCUgrid.png|right|300px|thumb]]
+[[File:ZCUchessboard.png|right|300px|thumb]]
+[[File:ZCUnoise.png|right|300px|thumb]]
+
+== Petalinux ==
+PetaLinux è un kit di sviluppo software (SDK) Linux embedded destinato a progetti system-on-a-chip (SoC) basati su FPGA [7].
+
+=== Modifica architettura parte PL ===
+
+Per poter fare in modo che la parte PS e quindi un generico programma userspace linux possa interfacciarsi con le IP descritte precedentemente è necessario modificare leggermente l'architettura.
+
+[[File:HDMI_Framebuffer_arch.png|center|650px|thumb|Schema di funzionamento con framebuffer read e write.]]
+
+In particolare si è scelto di introdurre due ulteriori IP: '''framebuffer read''' e '''framebuffer write''' le quali rispettivamente gestiscono l'input del sottosistema ''hdmi_tx'' e l'output del sottosistema ''hdmi_rx''.
+Questo ci permette di disaccoppiare i due sottosistemi di trasmissione e ricezione, configurando opportunamente le IP introdotte. In altre parole, è possibile utilizzare il sistema in due diverse modalità:
+# Modalità passthrough: il cui funzionamento è analogo al progetto standalone.
+# Modalità Tx-only: in cui solo il sottosistema Tx viene utilizzato ed il framebuffer read è controllato unicamente dal processore.
+# Modalità Rx-only: in cui solo il sottosistema Rx viene utilizzato ed i frame catturati vengono trasferiti dal framebuffer write in memoria centrale.
+
+L'introduzione dei componenti framebuffer, introduce la possibilità di controllare arbitrariamente il flusso dati entrante o uscente dai sottosistemi. Dal punto di vista PL, '''tali sottosistemi sono comparabili a dei DMA''', pertanto, con un'opportuna configurazione i frame in ingresso o in uscita possono essere letti e scritti dalla memoria centrale del processore e quindi completamente controllabili dal processing system. 
+
+Nel caso in cui si voglia utilizzare la modalità passthrough i due DMA si configurano in lettura e scrittura dalla stessa locazione di memoria, condividendo il contenuto del framebuffer "riconnettendo" i due sottosistemi con l'ausilio del software.
+
+[[File:HDMIpasstrough_framebuffer.drawio.png|center|450px|thumb|Schema di funzionamento della modalita passthrough.]]
+
+=== Environment Set Up ===
+La creazione di una build funzionante di petalinux per la board ZCU102 che permetta un corretto funzionamento dell'hardware e del software linux, è caratterizzata da una procedura attenta e meticolosa. Per fare in modo che il design funzioni correttamente e che il sistema operativo disponga di tutte le funzionalità necessarie (librerie e moduli) è necessario seguire una serie di passaggi, brevemente descritti all'interno della seguente sezione.
+
+La versione di Petalinux che è stata scaricata ed utilizzata per il progetto è la '''2021.1''', di conseguenza, versioni precedenti o successive potrebbero differire nell'utilizzo comandi proposti o presentare problemi di compatibilità con la board o con la versione di Vivado/Vitis dalla quale si estrapola il bsp file. 
+
+==== Creazione progetto tramite .xsa ====
+Per creare la build di petalinux, il primo step e creare un progetto from scratch, dopo aver opportunamente importato i settings di ambiente:
+
+        source <path-to-installed-PetaLinux>/settings.sh
+
+        petalinux-create -t project -n name -s <path-to-bsp>
+
+Per fare in modo che la build di petalinux incorpori il design sintetizzato in Vivado, è necessario introdurre il file .xsa generato nella cartella del progetto:
+
+        cp hdmi_proj.xsa petalinux_proj/project-spec/hw-description/system.xsa
+
+[[File:HDMIcontrollerFramebufferTPG.png|center|850px|thumb|Design dell'architettura dotata di framebuffer read e write.]]
+
+=== Configurazione e compilazione ===
+==== Configurazione rootfs e moduli hdmi====
+Uno degli aspetti più importanti del tool Petalinux è la sua caratteristica di essere altamente configurabile, in modo tale da facilitare gli utenti nella realizzazione di una build che meglio si adatti alle loro esigenze specifiche in termini di moduli e librerie da introdurre nella configurazione del sistema. In particolare, il modulo kernel necessario al funzionamento del controller HDMI è distribuito come ''out of tree module'', ovvero necessita di un import esplicito per poterlo includere nella build kernel. Tali risorse esterne sono le '''hdmi-recipes'''. Di default, tali risorse non sono incluse in petalinux e non farebbero parte della build. Possono essere scaricate sulla repo github ufficiale [8] e posizionate nel seguente path:
+<code>petalinux_proj/project-spec/meta-user</code>
+
+Per permettere al tool di configurazione di riconoscere l'introduzione dei driver scaricati dall'utente, è necessario introdurre la seguente riga di codice: 	<code>CONFIG_kernel-module-hdmi</code> all'interno del file ''user-rootfsconfig'', localizzato nella seguente cartella:
+<code>hdmi_proj/project-spec/meta-user/conf</code>
+
+Inoltre, le risorse hardware sintetizzate devono essere gestite e allocate correttamente per evitare conflitti e garantire che le applicazioni possano utilizzare le risorse in modo coerente e senza interferenze. Per questo motivo, oltre ai moduli hdmi esterni, è necessario introdurre alcune libreria aggiuntive dette '''libdrm'''. L'introduzione della libreria libdrm in Petalinux consente di fornire un'interfaccia di gestione delle risorse hardware standardizzata e semplificata, in particolare, permette di allocare, configurare le risorse hardware necessarie per l'esecuzione di applicazioni specifiche.
+
+Per importare correttamente queste risorse all'interno della build di petalinux, è sufficiente effettuare una configurazione manuale. Posizionandosi nella cartella del progetto è possibile richiamare il comando adibito alla configurazione del root file system:
+ <code>petalinux-config -c rootfs</code>
+
+All'interno della schermata della configurazione è sufficiente navigare nelle locazioni <code>rootfs-config -> user packages -> kernel-module-hdmi  </code> per selezionare i driver richiesti in maniera personalizzata dall'utente.
+
+[[File:PetalinuxHDMI1.png|center|450px|thumb|Selezione dei moduli HDMI nella rootfs configuration.]]
+
+Per poter includere, invece, le librm necessarie è sufficiente tornare nella schermata principale della configurazione e selezionare le caselle '''libdrm''','''libdrm-tests''','''libdrm-drivers''' e '''libdrm-kms''', seguendo il seguente path: <code>rootfs-config -> Filesystem Packages -> x11 -> base -> libdrm </code> 
+
+[[File:PetalinuxHDMI2.png|center|450px|thumb|Selezione delle librerie libdrm nella rootfs configuration.]]
+
+Infine, se tutta la procedura è avvenuta in maniera corretta, è possibile effettuare finalmente la build di petalinux, grazie alla quale avviene la vera e propria compilazione del progetto personalizzato per la piattaforma di destinazione.
+
+==== Configurazione tool di test ====
+Per poter testare il sistema si è deciso di utilizzare dei tool a riga di comando (sviluppati appositamente per tale scopo) i quali vanno ad utilizzare le syscall offerte dal modulo hdmi incluso nel kernel. 
+Tale soluzione ci permette di interfacciarsi con i componenti hardware sintetizzati in maniera veloce e ottimizzata riducendo l'overhead del processo di test.
+
+I tool in esame sono:
+* <code>yavta</code> (Yet Another V4L2  Test Application) [https://git.ideasonboard.org/yavta.git]: Applicativo per testare device con interfaccia driver V4L2 [https://www.kernel.org/doc/html/v4.9/media/uapi/v4l/v4l2.html], nel nostro utilizzata dalle IP TPG e Framebuffer Write.  
+* <code>modetest</code>[https://wiki-archive.linaro.org/xinliang/libdrm/modetest]: Applicativo utile al test di device con driver di tipologia DRM [https://www.kernel.org/doc/html/v4.10/gpu/drm-internals.html] quali Framebuffer Read. 
+* <code>gstreamer</code>[https://gstreamer.freedesktop.org/]: Framework open source per la gestione di stream audio/video utile per il test complessivo dell'architettura. 
+
+
+[[File:HDMItestingtools.png|center|450px|thumb|Setup dei tool adibiti al testing delle funzionalità HDMI.]]
+
+==== Build della configurazione ====
+Una volta aggiornate le dipenze necessarie è possibile passare alla compilazione eseguendo il comando:
+<code>petalinux-build</code>
+
+Dopo la compilazione, è sufficiente utilizzare il comando <code>petalinux-package</code> per generare l'immagine di sistema '''BOOT.bin''' che può essere effettivamente caricata sulla board. L'immagine comprende il kernel Linux, il root file system e altri componenti necessari per il funzionamento dello stesso.
+
+=== Boot e test del sistema ===
+Per effettuare un test dell'avvenuto successo della build si hanno, in generale, due possibilità:
+#Testare l'immagine del SO in modalità QEMU (emulando il dispositivo fisico).
+#Testare l'immagine del SO in caricandolo sulla board.
+
+Una prima prova per il funzionamento della build appena creata è fruibile tramite QEMU. Tuttavia, dato l'utilizzo di un processo di emulazione, non si hanno a disposizione tutte le periferiche o caratteristiche specifiche presenti sulla piattaforma di destinazione. Alcune funzionalità hardware potrebbero essere emulate in modo approssimato o potrebbero non essere disponibili.
+
+Per effettuare il boot del sistema tramite QEMU è sufficiente eseguire il seguente comando nella cartella principale per progetto:
+<code>petalinux-boot --QEMU --kernel</code>
+
+Se l'immagine BOOT.bin è stata generata correttamente, un terminale ubuntu apparirà a schermo dando la possibilità all'utente di testare il sistema sotto emulazione.
+
+Per caricare il sistema operativo sulla board vera e propria è necessario utilizzare una scheda SD e sfruttare l'apposito slot presente sulla scheda.
+La scheda SD viene preparata caricondone all'interno i file: ''boot.scr'',''BOOT.bin'' e ''image.ub''.
+
+Una volta impostati i pin della board per selezionare il boot mediante supporto SD, all'accensione del sistema avviene il caricamento del sistema operativo linux.  
+
+Per verificare la presenza effettiva dei moduli necessari al funzionamento dei sottosistema tx ed rx sintetizzati sulla parte PL, è sufficiente ricercare attraverso il comando: '''modprobe'''.
+
+[[File:HDMIgrep.png|center|550px|thumb|Verifica della presenza dei moduli necessari al funzionamento del Tx-Rx HDMI subsystem.]]
+
+Se vengono identificati correttamente i moduli necessari, è possibile effettuare un semplice test visivo, sfruttando lo strumento diagnostico denominato '''modetest'''. 
+
+<code>modetest -M xlnx -s <connector_id>[@<crtc_id>]:<mode>[-<vrefresh>][@<format></code>
+
+Consente di testare e verificare le modalità video supportate dal sistema, inclusi i diversi formati, frequenze di aggiornamento e risoluzioni video, ad esempio:
+
+<code>modetest -M xlnx -s 30@28:1920x1080-60@YUYV &</code>
+
+L'output che certifica il corretto funzionamento del sistema e la sua predisposizione alla comunicazione con le periferiche esterne, mostra a schermo una sintesi degli encoders, dei connettori e delle modalità di trasferimento consentite:
+
+        Encoders:
+        id      crtc    type    possible crtcs  possible clones
+        29      28      TMDS    0x00000001      0x00000000
+        
+        Connectors:
+        id      encoder status          name            size (mm)       modes   encoders
+        30      29      connected       HDMI-A-1        600x340         28      29
+        modes:
+                name refresh (Hz) hdisp hss hse htot vdisp vss vse vtot)
+        3840x2160 60 3840 4016 4104 4400 2160 2168 2178 2250 594000 flags: phsync, pvsync; type: preferred, driver
+        3840x2160 60 3840 4016 4104 4400 2160 2168 2178 2250 593407 flags: phsync, pvsync; type: driver
+        3840x2160 50 3840 4896 4984 5280 2160 2168 2178 2250 594000 flags: phsync, pvsync; type: driver
+        3840x2160 30 3840 4016 4104 4400 2160 2168 2178 2250 297000 flags: phsync, nvsync; type: driver
+        3840x2160 30 3840 4016 4104 4400 2160 2168 2178 2250 297000 flags: phsync, pvsync; type: driver
+        3840x2160 30 3840 4016 4104 4400 2160 2168 2178 2250 296703 flags: phsync, pvsync; type: driver
+        3840x2160 25 3840 4896 4984 5280 2160 2168 2178 2250 297000 flags: phsync, pvsync; type: driver
+        3840x2160 24 3840 5116 5204 5500 2160 2168 2178 2250 297000 flags: phsync, pvsync; type: driver
+        3840x2160 24 3840 5116 5204 5500 2160 2168 2178 2250 296703 flags: phsync, pvsync; type: driver
+        1920x1080 60 1920 2008 2052 2200 1080 1084 1089 1125 148500 flags: phsync, nvsync; type: driver
+        1920x1080 60 1920 2008 2052 2200 1080 1084 1089 1125 148500 flags: phsync, pvsync; type: driver
+        1920x1080 60 1920 2008 2052 2200 1080 1084 1089 1125 148352 flags: phsync, pvsync; type: driver
+        1920x1080 30 1920 2008 2052 2200 1080 1084 1089 1125 74250 flags: phsync, pvsync; type: driver
+        1920x1080 30 1920 2008 2052 2200 1080 1084 1089 1125 74176 flags: phsync, pvsync; type: driver
+        1920x1080 24 1920 2558 2602 2750 1080 1084 1089 1125 74250 flags: phsync, pvsync; type: driver
+        1920x1080 24 1920 2558 2602 2750 1080 1084 1089 1125 74176 flags: phsync, pvsync; type: driver
+        1600x900 60 1600 1624 1704 1800 900 901 904 1000 108000 flags: phsync, pvsync; type: driver
+        1280x1024 60 1280 1328 1440 1688 1024 1025 1028 1066 108000 flags: phsync, pvsync; type: driver
+        1280x800 60 1280 1328 1360 1440 800 803 809 823 71000 flags: phsync, nvsync; type: driver
+        1152x864 60 1152 1216 1336 1520 864 865 868 895 81579 flags: nhsync, pvsync; type:
+        1280x720 60 1280 1390 1430 1650 720 725 730 750 74250 flags: phsync, pvsync; type: driver
+        1280x720 60 1280 1390 1430 1650 720 725 730 750 74176 flags: phsync, pvsync; type: driver
+        1024x768 60 1024 1048 1184 1344 768 771 777 806 65000 flags: nhsync, nvsync; type: driver
+        800x600 60 800 840 968 1056 600 601 605 628 40000 flags: phsync, pvsync; type: driver
+        720x480 60 720 736 798 858 480 489 495 525 27027 flags: nhsync, nvsync; type: driver
+        720x480 60 720 736 798 858 480 489 495 525 27000 flags: nhsync, nvsync; type: driver
+        640x480 60 640 656 752 800 480 490 492 525 25200 flags: nhsync, nvsync; type: driver
+        640x480 60 640 656 752 800 480 490 492 525 25175 flags: nhsync, nvsync; type: driver
+        props:
+                1 EDID:
+                        flags: immutable blob
+                        blobs:
+        
+                        value:
+                                00ffffffffffff001e6d085b92a10400
+                                031a0103803c2278ea3035a7554ea326
+                                0f50542108007140818081c0a9c0d1c0
+                                81000101010108e80030f2705a80b058
+                                8a0058542100001e04740030f2705a80
+                                b0588a0058542100001a000000fd0038
+                                3d1e873c000a202020202020000000fc
+                                004c4720556c7472612048440a2001d9
+                                020330714d902220050403020161605d
+                                5e5f230907076d030c001000b83c2000
+                                6001020367d85dc401788003e30f0003
+                                023a801871382d40582c450058542100
+                                001a0000000000000000000000000000
+                                00000000000000000000000000000000
+                                00000000000000000000000000000000
+                                00000000000000000000000000000026
+                2 DPMS:
+                        flags: enum
+                        enums: On=0 Standby=1 Suspend=2 Off=3
+                        value: 0
+                5 link-status:
+                        flags: enum
+                        enums: Good=0 Bad=1
+                        value: 0
+        
+        CRTCs:
+        id      fb      pos     size
+        28      47      (0,0)   (3840x2160)
+        3840x2160 60 3840 4016 4104 4400 2160 2168 2178 2250 594000 flags: phsync, pvsync; type: preferred, driver
+        props:
+        
+        Planes:
+        id      crtc    fb      CRTC x,y        x,y     gamma size      possible crtcs
+        27      28      47      0,0             0,0     0               0x00000001
+        formats: XB24 XB30 XR24 XV24 VU24 XV30 YUYV UYVY NV16 NV12 XV15 XV20 BG24 GREY Y10  RG24
+        props:
+                6 type:
+                        flags: immutable enum
+                        enums: Overlay=0 Primary=1 Cursor=2
+                        value: 1
+        
+        Frame buffers:
+        id      size    pitch
+
+Con il tool yavta è possibile interfacciarsi con il driver del componente TPG. Questo ci permette di verificarne il corretto funzionamento e disattivarlo per eseguire il test degli altri componenti.
+
+        <code>yavta --no-query -l /dev/v4l-subdev0</code>
+
+        Device /dev/v4l-subdev0 opened.
+        --- User Controls (class 0x00980001) ---
+        control 0x0098c903 `Test Pattern: Color Mask' min 0 max 7 step 0 default 0 current 0.
+        control 0x0098c907 `Test Pattern: Motion Speed' min 0 max 255 step 1 default 4 current 4.
+        control 0x0098c908 `Test Pattern: Cross Hairs Row' min 0 max 4095 step 1 default 100 current 100.
+        control 0x0098c909 `Test Pattern: Cross Hairs Colum' min 0 max 4095 step 1 default 100 current 100.
+        control 0x0098c90a `Test Pattern: Zplate Horizontal' min 0 max 65535 step 1 default 30 current 30.
+        control 0x0098c90b `Test Pattern: Zplate Horizontal' min 0 max 65535 step 1 default 0 current 0.
+        control 0x0098c90c `Test Pattern: Zplate Vertical S' min 0 max 65535 step 1 default 1 current 1.
+        control 0x0098c90d `Test Pattern: Zplate Vertical S' min 0 max 65535 step 1 default 0 current 0.
+        control 0x0098c90e `Test Pattern: Box Size' min 0 max 4095 step 1 default 50 current 50.
+        control 0x0098c90f `Test Pattern: Box Color(RGB/YCb' min 0 max 16777215 step 1 default 0 current 0.
+        control 0x0098c912 `Test Pattern: Foreground Patter' min 0 max 2 step 1 default 0 current 0.
+        0: No Overlay (*)
+        1: Moving Box
+        2: Cross Hairs
+        --- Image Source Controls (class 0x009e0001) ---
+        control 0x009e0901 `Vertical Blanking' min 3 max 8159 step 1 default 100 current 100.
+        control 0x009e0902 `Horizontal Blanking' min 3 max 8159 step 1 default 100 current 100.
+        --- Image Processing Controls (class 0x009f0001) ---
+        control 0x009f0903 `Test Pattern' min 0 max 16 step 1 default 9 current 9.
+        1: Horizontal Ramp
+        2: Vertical Ramp
+        3: Temporal Ramp
+        4: Solid Red
+        5: Solid Green
+        6: Solid Blue
+        7: Solid Black
+        8: Solid White
+        9: Color Bars (*)
+        10: Zone Plate
+        11: Tartan Color Bars
+        12: Cross Hatch
+        13: Color Sweep
+        14: Vertical/Horizontal Ramps
+        15: Black/White Checker Board
+        16: PseudoRandom
+        14 controls found.
+
+Per esempio, volendo attivare la modalità colorbar, eseguiamo il comando 
+<code>yavta -w 0x009f0903 9 /dev/v4l-subdev0</code>
+
+Per testare il funzionamento del sottosistema Rx, è sufficiente utilizzare un comando yavta adibito alla cattura di frame di uno stream video. Il funzionamento del comando prevede che, a partire da un insieme di frame scritti in memoria sfruttando il framebuffer write, è possibile accedere arbitrariamente al contenuto della memoria sottoposta alla scrittura, ispezionandone il contenuto per verificarne il corretto funzionamento.
+
+        yavta -c10 -f YUYV -s 1920x1080 --skip 7 -F /dev/video0 &&
+        [2] 2362
+        Device /dev/video0 opened.
+        Device `vcap_hdmi output 0' on `platform:vcap_hdmi:0' is a video output (without mplanes) device.
+        Video format set: YUYV (56595559) 1920x1080 field 
+        ...
+        Captured 10 frames in 0.265432 seconds (29.45686 fps, 0.000000 B/s).
+        8 buffers released.        
+        [2]-  Done                    yavta -c10 -f YUYV -s 1920x1080 --skip 7 -F /dev/video0
+        
+Il comando in questione, ispeziona il contenuto della memoria alla ricerca dei frame scritti dal framebuffer, effettuando una cattura delle immagini su disco.
+
+Infine, per testare il sistema a più alto livello, possiamo verificare il corretto funzionamento della modalità passthrough, ossia quella che comprende il funzionamento simultaneo di tutte le IP incluse nel progetto.
+
+<code>gst-launch-1.0 v4l2src device=/dev/video0 io-mode=4 '!' video/x-raw, width=1920, height=1080, framerate=60/1, format=RGB '!' kmssink bus-id=amba_pl\@0\:drm-dmaengine-drv connector-id=31 force-modesetting=1</code>
+
+Tale comando comunica al sottosistema Rx di ricevere in ingresso uno stream 1920x1080p comunicando alla sorgente un EDID compatibile, l'output viene posto in un framebuffer di dimensioni opportune allocato in memoria RAM. Contemporaneamente configura il sottosistem Tx alla tramissione di uno stream video della stessa risoluzione che ha come input lo stesso framebuffer. Nel complesso questo comporta l'inoltro dello stream in ingresso verso l'hdmi sink in uscita, replicando l'effettivo funzionamento del design standalone passthrough.
+
+[[File:PassthroughLabExample.png|center|750px|thumb|Esempio di funzionamento della modalità passthrough.]]
+
+== References ==
+[1]: HDMI wikipedia: https://it.wikipedia.org/wiki/High-Definition_Multimedia_Interface
+
+[2]: Xilinx Wiki: http:/https://xilinx-wiki.atlassian.net
+
+[3]: HDMI 1.4/2.0 Transmitter Subsystem Product Guide (PG235): https://docs.xilinx.com/r/en-US/pg235-v-hdmi-tx-ss?tocId=XLSPfpAut4Tw1N_71V9XKQ
+
+[4]: Video PHY Controller LogiCORE IP Product Guide (PG230) Documentation: https://docs.xilinx.com/r/en-US/pg230-vid-phy-controller/Core-Overview
+
+[5]: AMBA 4 AXI4-Stream Protocol Specification: https://developer.arm.com/documentation/ihi0051/a/
+
+[6]: Video Test Pattern GeneratorProduct Guide: https://docs.xilinx.com/r/en-US/pg103-v-tpg
+
+[7]: PetaLinux Tools Documentation: Reference Guide (UG1144): https://docs.xilinx.com/r/en-US/ug1144-petalinux-tools-reference-guide/Overview
+
+[8]: HDMI modules [Xilinx]: https://github.com/Xilinx/hdmi-modules
