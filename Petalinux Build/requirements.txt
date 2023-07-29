@@ -1,4 +1,44 @@
+***** SETUP UBUNTU 18.04.5 VM *****
+
+apt-get install virtualbox-guest-utils virtualbox-guest-x11 virtualbox-guest-dkms
+
+sudo apt-get install libncurses5-dev libncursesw5-dev libtool net-tools autoconf xterm texinfo gcc-multilib gawk zlib1g libz1:i386 zlib1g-dev build-essential
+
+sudo adduser <YOUR_USERNAME> vboxsf
+
+petalinux-package --boot --fpga images/linux/system.bit --fsbl images/linux/zynqmp_fsbl.elf --pmufw images/linux/pmufw.elf --u-boot
+
+***** BUILD PETALINUX PROJECT *****
+
+## COMMANDS ##:
+--create your petalinux project
+petalinux create -t project -n <PROJECT_NAME> -s <PATH_TO_BSP> 
+
+--configure rootfs
+petalinux-config -c rootfs
+
+--configure kernel
+petalinux-config -c kernel
+  
+## REQUIREMENTS ##:
 1. HDMI Controller with TPG Project .xsa
 2. Board Support Package ZCU102 v.2018 
 3. HDMI modules download 
 4. Testing tools
+
+***** TESTING COMPONENTS *****
+
+media-ctl -p
+
+modetest -M xilinx_drm_mixer -s 37:640x480@BG24 -v
+
+gst-launch-1.0 v4l2src device=/dev/video2 io-mode=4 '!' video/x-raw, width=1920, height=1080, framerate=60/1, format=RGB '!' kmssink bus-id=amba_pl\@0\:drm-dmaengine-drv connector-id=31 force-modesetting=1
+
+(-The device for v4l2src can be found with "media-ctl -p")
+(-bus-id can be found in /sys/devices/platform/amba_pl@0 and finding the name of the drm-dmaengine)
+(-connector-id can be found in modetest -D name_of_the_drm_dmaengine_above)
+
+gst-launch-1.0 -v filesrc location=some.png ! decodebin ! videoconvert ! imagefreeze ! autovideosink
+
+follow .wikitext guide for details
+
